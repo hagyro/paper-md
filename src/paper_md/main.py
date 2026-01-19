@@ -2,8 +2,11 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .api.routes import router
 from .config import get_settings
@@ -17,6 +20,9 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Path to static files
+STATIC_DIR = Path(__file__).parent / "static"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,9 +34,8 @@ async def lifespan(app: FastAPI):
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Temp directory: {settings.temp_dir}")
 
-    # Check OpenAI API key
-    if not settings.openai_api_key:
-        logger.warning("OpenAI API key not configured - figure descriptions will be unavailable")
+    # Log vision provider
+    logger.info(f"Vision provider: {settings.vision_provider.value}")
 
     yield
 
@@ -48,3 +53,13 @@ app = FastAPI(
 
 # Include API routes
 app.include_router(router)
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Serve the main web interface."""
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+# Mount static files (for any additional assets)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
