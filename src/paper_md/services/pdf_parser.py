@@ -1,7 +1,9 @@
 """PDF parsing service using PyMuPDF."""
 
 import base64
+import io
 import logging
+import re
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -15,6 +17,11 @@ from ..models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Pattern to match table headers (must be near start of a line, often followed by caption)
+TABLE_HEADER_PATTERN = re.compile(
+    r"^\s*Table\s+(\d+)[\.:]?\s*(.{0,100}?)(?:\n|$)", re.IGNORECASE | re.MULTILINE
+)
 
 
 def extract_pdf(file_path: Path) -> PDFDocument:
@@ -185,45 +192,143 @@ def _extract_images(page: fitz.Page, page_num: int) -> list[ImageData]:
 
 
 def _detect_tables(page: fitz.Page, page_num: int) -> list[TableData]:
-    """Detect tables using PyMuPDF's table finder."""
+    """Detect tables using text pattern matching and extract as images."""
     tables = []
+    page_text = page.get_text()
+    seen_table_nums = set()  # Track seen table numbers on this page
 
-    try:
-        # Use PyMuPDF's table finder
-        table_finder = page.find_tables()
+    # Find table headers using regex pattern
+    for match in TABLE_HEADER_PATTERN.finditer(page_text):
+        table_num = int(match.group(1))
 
-        for table in table_finder:
-            bbox = table.bbox
-            # Extract table content
-            content = []
-            for row in table.extract():
-                # Clean up cells - replace None with empty string, strip whitespace
-                cleaned_row = []
-                for cell in row:
-                    if cell is None:
-                        cleaned_row.append("")
-                    else:
-                        # Clean the cell text
-                        cell_text = str(cell).strip()
-                        # Replace newlines with spaces
-                        cell_text = " ".join(cell_text.split())
-                        cleaned_row.append(cell_text)
-                content.append(cleaned_row)
+        # Skip if we've already seen this table number on this page
+        if table_num in seen_table_nums:
+            continue
+        seen_table_nums.add(table_num)
 
-            # Only add if table has meaningful content
-            if content and len(content) > 1:
-                tables.append(
-                    TableData(
-                        page_num=page_num,
-                        bbox=(bbox.x0, bbox.y0, bbox.x1, bbox.y1),
-                        content=content,
-                    )
+        caption = match.group(2).strip() if match.group(2) else ""
+
+        # Find the text block containing this table header
+        text_dict = page.get_text("dict")
+        table_start_y = None
+
+        for block in text_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            block_text = ""
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    block_text += span.get("text", "")
+
+            if f"Table {table_num}" in block_text or f"Table{table_num}" in block_text:
+                table_start_y = block.get("bbox", [0, 0, 0, 0])[1]
+                break
+
+        if table_start_y is None:
+            continue
+
+        # Define table region - from header to a reasonable endpoint
+        # Look for next "Table X" header or "Notes:" or end of page
+        page_rect = page.rect
+        table_end_y = page_rect.height
+
+        # Look for end markers
+        end_patterns = [
+            f"Table {table_num + 1}",
+            "Notes:",
+            "Source:",
+            "Figure ",
+        ]
+
+        for block in text_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            block_bbox = block.get("bbox", [0, 0, 0, 0])
+            if block_bbox[1] <= table_start_y:
+                continue
+
+            block_text = ""
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    block_text += span.get("text", "")
+
+            for pattern in end_patterns:
+                if pattern in block_text:
+                    table_end_y = min(table_end_y, block_bbox[1])
+                    break
+
+        # Extract table region as image
+        margin = 10
+        clip_rect = fitz.Rect(
+            margin,
+            max(0, table_start_y - margin),
+            page_rect.width - margin,
+            min(page_rect.height, table_end_y + margin)
+        )
+
+        try:
+            # Render at higher resolution for better OCR
+            mat = fitz.Matrix(2, 2)  # 2x scale
+            pix = page.get_pixmap(matrix=mat, clip=clip_rect)
+            img_bytes = pix.tobytes("png")
+            image_base64 = base64.b64encode(img_bytes).decode("utf-8")
+
+            tables.append(
+                TableData(
+                    page_num=page_num,
+                    bbox=(clip_rect.x0, clip_rect.y0, clip_rect.x1, clip_rect.y1),
+                    content=[],  # Will be filled by vision model
+                    image_base64=image_base64,
+                    table_number=table_num,
+                    caption=caption,
                 )
-                logger.debug(f"Found table on page {page_num} with {len(content)} rows")
+            )
+            logger.debug(f"Extracted Table {table_num} image from page {page_num}")
+        except Exception as e:
+            logger.warning(f"Failed to extract table {table_num} image: {e}")
 
-    except AttributeError:
-        logger.debug("Table detection not available in this PyMuPDF version")
-    except Exception as e:
-        logger.warning(f"Table detection failed on page {page_num}: {e}")
+    # Also try PyMuPDF's built-in table finder as fallback
+    if not tables:
+        try:
+            table_finder = page.find_tables()
+            for idx, table in enumerate(table_finder):
+                bbox = table.bbox
+                content = []
+                for row in table.extract():
+                    cleaned_row = []
+                    for cell in row:
+                        if cell is None:
+                            cleaned_row.append("")
+                        else:
+                            cell_text = str(cell).strip()
+                            cell_text = " ".join(cell_text.split())
+                            cleaned_row.append(cell_text)
+                    content.append(cleaned_row)
+
+                if content and len(content) > 1:
+                    # Also extract as image for better accuracy
+                    try:
+                        clip_rect = fitz.Rect(bbox.x0 - 5, bbox.y0 - 5, bbox.x1 + 5, bbox.y1 + 5)
+                        mat = fitz.Matrix(2, 2)
+                        pix = page.get_pixmap(matrix=mat, clip=clip_rect)
+                        img_bytes = pix.tobytes("png")
+                        image_base64 = base64.b64encode(img_bytes).decode("utf-8")
+                    except:
+                        image_base64 = None
+
+                    tables.append(
+                        TableData(
+                            page_num=page_num,
+                            bbox=(bbox.x0, bbox.y0, bbox.x1, bbox.y1),
+                            content=content,
+                            image_base64=image_base64,
+                        )
+                    )
+                    logger.debug(f"Found table on page {page_num} with {len(content)} rows")
+
+        except AttributeError:
+            logger.debug("Table detection not available in this PyMuPDF version")
+        except Exception as e:
+            logger.warning(f"Table detection failed on page {page_num}: {e}")
 
     return tables

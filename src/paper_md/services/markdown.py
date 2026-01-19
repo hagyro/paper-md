@@ -23,6 +23,7 @@ def generate_markdown(
     structure: DocumentStructure,
     metadata: PaperMetadata,
     figure_descriptions: list[FigureDescription],
+    table_descriptions: dict[int, str] = None,
 ) -> ConversionResult:
     """Generate Markdown from extracted document data.
 
@@ -31,10 +32,12 @@ def generate_markdown(
         structure: Analyzed document structure.
         metadata: Extracted paper metadata.
         figure_descriptions: AI-generated figure descriptions.
+        table_descriptions: Vision-extracted markdown tables (index -> markdown).
 
     Returns:
         ConversionResult with markdown content.
     """
+    table_descriptions = table_descriptions or {}
     parts = []
 
     # Add YAML frontmatter
@@ -84,8 +87,16 @@ def generate_markdown(
     if tables:
         parts.append("\n## Tables\n")
         for i, table in enumerate(tables):
-            parts.append(f"\n### Table {i + 1}\n")
-            parts.append(_render_table(table))
+            table_num = table.table_number or (i + 1)
+            parts.append(f"\n### Table {table_num}\n")
+            if table.caption:
+                parts.append(f"*{table.caption}*\n\n")
+            # Use vision-extracted markdown if available
+            if i in table_descriptions and table_descriptions[i]:
+                parts.append(table_descriptions[i])
+                parts.append("\n")
+            else:
+                parts.append(_render_table(table))
 
     # Add references
     if metadata.references:

@@ -6,7 +6,7 @@ import logging
 import httpx
 
 from ..config import get_settings, VisionProvider
-from ..models import FigureDescription, ImageData
+from ..models import FigureDescription, ImageData, TableData
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,20 @@ Provide a comprehensive description that would allow someone to understand the f
 Format your response as:
 TYPE: [type of visualization]
 DESCRIPTION: [detailed description]"""
+
+# Prompt template for table extraction
+TABLE_PROMPT = """You are analyzing a table from an academic paper.
+
+Extract this table and format it as a proper markdown table.
+- Include ALL data visible in the table
+- Preserve the exact values, numbers, and text
+- Include any statistical significance markers (*, **, ***)
+- Include column headers and row labels
+- Use proper markdown table syntax with | separators
+- If there are multiple panels (Panel A, Panel B), format each separately
+
+Important: Return ONLY the markdown table(s), no additional explanation.
+If you cannot read the table clearly, describe what you can see."""
 
 
 async def describe_figures(
@@ -74,6 +88,153 @@ def _create_unavailable_descriptions(
         )
         for img in images
     ]
+
+
+async def describe_tables(tables: list[TableData], max_tables: int = 10) -> dict[int, str]:
+    """Generate markdown representations for tables using vision.
+
+    Args:
+        tables: List of TableData objects with image_base64.
+        max_tables: Maximum number of tables to process (default 10).
+
+    Returns:
+        Dictionary mapping table index to markdown table string.
+    """
+    settings = get_settings()
+    results = {}
+
+    if settings.vision_provider == VisionProvider.NONE:
+        logger.info("Vision provider set to NONE, skipping table extraction")
+        return results
+
+    # Filter tables with images and deduplicate by table number
+    tables_with_images = [t for t in tables if t.image_base64]
+    logger.info(f"Found {len(tables_with_images)} tables with images (max: {max_tables})")
+
+    # Deduplicate by table number
+    seen_numbers = set()
+    unique_tables = []
+    for t in tables_with_images:
+        if t.table_number is not None:
+            if t.table_number not in seen_numbers:
+                seen_numbers.add(t.table_number)
+                unique_tables.append(t)
+        else:
+            unique_tables.append(t)
+
+    # Limit to max_tables
+    tables_to_process = unique_tables[:max_tables]
+    logger.info(f"Processing {len(tables_to_process)} unique tables")
+
+    for idx, table in enumerate(tables_to_process):
+        table_id = table.table_number or (idx + 1)
+        logger.info(f"Extracting Table {table_id} via vision ({idx+1}/{len(tables_to_process)})")
+
+        try:
+            if settings.vision_provider == VisionProvider.OPENAI:
+                markdown = await _extract_table_openai(table)
+            elif settings.vision_provider == VisionProvider.OLLAMA:
+                markdown = await _extract_table_ollama(table)
+            elif settings.vision_provider == VisionProvider.GEMINI:
+                markdown = await _extract_table_gemini(table)
+            else:
+                continue
+
+            results[idx] = markdown
+            logger.info(f"Successfully extracted Table {table_id}")
+        except Exception as e:
+            logger.error(f"Failed to extract Table {table_id}: {e}")
+            results[idx] = f"*[Table extraction failed: {str(e)}]*"
+
+    return results
+
+
+async def _extract_table_openai(table: TableData) -> str:
+    """Extract table using OpenAI GPT-4V."""
+    from openai import AsyncOpenAI
+
+    settings = get_settings()
+    if not settings.openai_api_key:
+        raise ValueError("OpenAI API key not configured")
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+    response = await client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": TABLE_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{table.image_base64}",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            }
+        ],
+        max_tokens=2000,
+    )
+
+    return response.choices[0].message.content or ""
+
+
+async def _extract_table_ollama(table: TableData) -> str:
+    """Extract table using Ollama with LLaVA."""
+    settings = get_settings()
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        response = await client.post(
+            f"{settings.ollama_base_url}/api/generate",
+            json={
+                "model": settings.ollama_model,
+                "prompt": TABLE_PROMPT,
+                "images": [table.image_base64],
+                "stream": False,
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+
+    return result.get("response", "")
+
+
+async def _extract_table_gemini(table: TableData) -> str:
+    """Extract table using Google Gemini."""
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        raise ValueError("Gemini API key not configured")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{settings.gemini_model}:generateContent",
+            params={"key": settings.gemini_api_key},
+            json={
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": TABLE_PROMPT},
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/png",
+                                    "data": table.image_base64,
+                                }
+                            },
+                        ]
+                    }
+                ]
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+
+    try:
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        return str(result)
 
 
 # ============================================================

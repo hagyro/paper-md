@@ -72,6 +72,9 @@ class TableData(BaseModel):
     page_num: int
     bbox: tuple[float, float, float, float]
     content: list[list[str]] = Field(default_factory=list)
+    image_base64: Optional[str] = None  # For vision-based table extraction
+    table_number: Optional[int] = None  # Table number if detected
+    caption: Optional[str] = None  # Table caption if detected
 
 
 class PageData(BaseModel):

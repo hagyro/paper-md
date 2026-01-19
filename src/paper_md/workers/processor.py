@@ -12,7 +12,7 @@ from ..models import ConversionResult, JobStatus
 from ..services.pdf_parser import extract_pdf
 from ..services.structure import analyze_structure
 from ..services.metadata import extract_metadata
-from ..services.vision import describe_figures
+from ..services.vision import describe_figures, describe_tables
 from ..services.markdown import generate_markdown
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ class JobProcessor:
             metadata = extract_metadata(doc, structure)
             await self._update_status(job_id, JobStatus.PROCESSING, 0.5)
 
-            # Step 4: Describe figures (80%)
+            # Step 4: Describe figures (70%)
             logger.info(f"Job {job_id}: Describing figures")
             all_images = []
             for page in doc.pages:
@@ -100,15 +100,29 @@ class JobProcessor:
                 paper_title=metadata.title,
                 abstract=metadata.abstract,
             )
-            await self._update_status(job_id, JobStatus.PROCESSING, 0.8)
+            await self._update_status(job_id, JobStatus.PROCESSING, 0.7)
 
-            # Step 5: Generate markdown (100%)
+            # Step 5: Extract tables via vision (85%)
+            settings = get_settings()
+            table_descriptions = {}
+            if settings.enable_table_vision:
+                logger.info(f"Job {job_id}: Extracting tables via vision")
+                all_tables = []
+                for page in doc.pages:
+                    all_tables.extend(page.tables)
+                table_descriptions = await describe_tables(all_tables)
+            else:
+                logger.info(f"Job {job_id}: Table vision disabled, using text extraction")
+            await self._update_status(job_id, JobStatus.PROCESSING, 0.85)
+
+            # Step 6: Generate markdown (100%)
             logger.info(f"Job {job_id}: Generating markdown")
             result = generate_markdown(
                 doc=doc,
                 structure=structure,
                 metadata=metadata,
                 figure_descriptions=figure_descriptions,
+                table_descriptions=table_descriptions,
             )
 
             # Update job with result

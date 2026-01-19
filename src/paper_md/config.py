@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-1.5-flash"
 
+    # Table processing
+    enable_table_vision: bool = False  # Disabled by default due to LLaVA accuracy issues
+
     # File handling
     max_file_size_mb: int = 50
     temp_dir: Path = Path("/tmp/paper_md")
