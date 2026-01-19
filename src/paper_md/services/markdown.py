@@ -13,6 +13,7 @@ from ..models import (
     SectionType,
     TableData,
 )
+from .table_formatter import detect_and_format_tables
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,9 @@ def generate_markdown(
             parts.append(f"{ref.index}. {ref.raw_text}\n")
 
     markdown = "\n".join(parts)
+
+    # Post-process to detect and format text-based tables
+    markdown = detect_and_format_tables(markdown)
 
     return ConversionResult(
         markdown=markdown,

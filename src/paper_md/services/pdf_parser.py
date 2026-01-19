@@ -45,9 +45,13 @@ def extract_pdf(file_path: Path) -> PDFDocument:
 
 def _extract_page(page: fitz.Page, page_num: int) -> PageData:
     """Extract all content from a single page."""
-    text_blocks = _extract_text_blocks(page, page_num)
-    images = _extract_images(page, page_num)
+    # Detect tables first so we can exclude their regions from text extraction
     tables = _detect_tables(page, page_num)
+    table_bboxes = [t.bbox for t in tables]
+
+    # Extract text blocks, excluding table regions
+    text_blocks = _extract_text_blocks(page, page_num, table_bboxes)
+    images = _extract_images(page, page_num)
 
     return PageData(
         page_num=page_num,
@@ -59,15 +63,47 @@ def _extract_page(page: fitz.Page, page_num: int) -> PageData:
     )
 
 
-def _extract_text_blocks(page: fitz.Page, page_num: int) -> list[TextBlock]:
+def _is_inside_bbox(inner_bbox: tuple, outer_bbox: tuple, threshold: float = 0.5) -> bool:
+    """Check if inner_bbox is mostly inside outer_bbox."""
+    ix0, iy0, ix1, iy1 = inner_bbox
+    ox0, oy0, ox1, oy1 = outer_bbox
+
+    # Calculate intersection
+    inter_x0 = max(ix0, ox0)
+    inter_y0 = max(iy0, oy0)
+    inter_x1 = min(ix1, ox1)
+    inter_y1 = min(iy1, oy1)
+
+    if inter_x1 <= inter_x0 or inter_y1 <= inter_y0:
+        return False
+
+    inter_area = (inter_x1 - inter_x0) * (inter_y1 - inter_y0)
+    inner_area = (ix1 - ix0) * (iy1 - iy0)
+
+    if inner_area <= 0:
+        return False
+
+    return (inter_area / inner_area) >= threshold
+
+
+def _extract_text_blocks(
+    page: fitz.Page, page_num: int, exclude_bboxes: list[tuple] = None
+) -> list[TextBlock]:
     """Extract text blocks with position and font metadata."""
     blocks = []
+    exclude_bboxes = exclude_bboxes or []
 
     # Get text with detailed information
     text_dict = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
 
     for block in text_dict.get("blocks", []):
         if block.get("type") != 0:  # Skip non-text blocks
+            continue
+
+        bbox = tuple(block.get("bbox", (0, 0, 0, 0)))
+
+        # Skip if this block is inside a table region
+        if any(_is_inside_bbox(bbox, table_bbox) for table_bbox in exclude_bboxes):
             continue
 
         block_text = ""
@@ -91,12 +127,11 @@ def _extract_text_blocks(page: fitz.Page, page_num: int) -> list[TextBlock]:
         if not block_text:
             continue
 
-        bbox = block.get("bbox", (0, 0, 0, 0))
         blocks.append(
             TextBlock(
                 text=block_text,
                 page_num=page_num,
-                bbox=tuple(bbox),
+                bbox=bbox,
                 font_size=font_size,
                 font_name=font_name,
                 is_bold=is_bold,
@@ -150,32 +185,45 @@ def _extract_images(page: fitz.Page, page_num: int) -> list[ImageData]:
 
 
 def _detect_tables(page: fitz.Page, page_num: int) -> list[TableData]:
-    """Detect tables based on layout analysis.
-
-    This is a simplified heuristic-based approach that looks for
-    grid-like structures in the page.
-    """
+    """Detect tables using PyMuPDF's table finder."""
     tables = []
 
-    # Use PyMuPDF's table finder if available (PyMuPDF >= 1.23.0)
     try:
-        page_tables = page.find_tables()
-        for table in page_tables:
+        # Use PyMuPDF's table finder
+        table_finder = page.find_tables()
+
+        for table in table_finder:
             bbox = table.bbox
             # Extract table content
             content = []
             for row in table.extract():
-                content.append([cell if cell else "" for cell in row])
+                # Clean up cells - replace None with empty string, strip whitespace
+                cleaned_row = []
+                for cell in row:
+                    if cell is None:
+                        cleaned_row.append("")
+                    else:
+                        # Clean the cell text
+                        cell_text = str(cell).strip()
+                        # Replace newlines with spaces
+                        cell_text = " ".join(cell_text.split())
+                        cleaned_row.append(cell_text)
+                content.append(cleaned_row)
 
-            tables.append(
-                TableData(
-                    page_num=page_num,
-                    bbox=(bbox.x0, bbox.y0, bbox.x1, bbox.y1),
-                    content=content,
+            # Only add if table has meaningful content
+            if content and len(content) > 1:
+                tables.append(
+                    TableData(
+                        page_num=page_num,
+                        bbox=(bbox.x0, bbox.y0, bbox.x1, bbox.y1),
+                        content=content,
+                    )
                 )
-            )
+                logger.debug(f"Found table on page {page_num} with {len(content)} rows")
+
     except AttributeError:
-        # Older PyMuPDF version without find_tables
         logger.debug("Table detection not available in this PyMuPDF version")
+    except Exception as e:
+        logger.warning(f"Table detection failed on page {page_num}: {e}")
 
     return tables
